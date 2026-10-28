@@ -1,0 +1,256 @@
+x-backend-environment: &backend-environment
+  DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY:?Set DJANGO_SECRET_KEY in .env}
+  DJANGO_DEBUG: ${DJANGO_DEBUG:-false}
+  DJANGO_ALLOWED_HOSTS: "${DJANGO_ALLOWED_HOSTS:-localhost,127.0.0.1},backend"
+  POSTGRES_DB: ${POSTGRES_DB:-nuam}
+  POSTGRES_HOST: postgres
+  POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+  JWT_ACCESS_MINUTES: ${JWT_ACCESS_MINUTES:-15}
+  JWT_REFRESH_HOURS: ${JWT_REFRESH_HOURS:-8}
+  LOGIN_MAX_ATTEMPTS: ${LOGIN_MAX_ATTEMPTS:-5}
+  LOGIN_LOCK_MINUTES: ${LOGIN_LOCK_MINUTES:-15}
+  LOGIN_RATE_LIMIT: ${LOGIN_RATE_LIMIT:-10/min}
+  MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-50}
+  CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-http://localhost:5173}
+  FACTOR_BASE_START: ${FACTOR_BASE_START:-8}
+  FACTOR_BASE_END: ${FACTOR_BASE_END:-19}
+  FACTOR_SUM_START: ${FACTOR_SUM_START:-8}
+  FACTOR_SUM_END: ${FACTOR_SUM_END:-16}
+
+services:
+  tls-init:
+    image: mongo:7@sha256:8bb4442761a63a8dda452744082cdac9644b429807eb977b42324a63cef59ca4
+    entrypoint: ["sh", "-c"]
+    command: ["sh /security/init-db-certs.sh"]
+    volumes:
+      - ./infra/security/init-db-certs.sh:/security/init-db-certs.sh:ro
+      - db_ca:/ca
+      - postgres_tls:/postgres
+      - mongo_tls:/mongo
+    restart: "no"
+
+  postgres:
+    image: postgres:16-alpine@sha256:0cefaabd882e42bcb2a2f3dc56d3ce4770560ba62fd7f197f1a2e008fd5731ab
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-nuam}
+      POSTGRES_USER: ${POSTGRES_ADMIN_USER:-nuam_admin}
+      POSTGRES_PASSWORD: ${POSTGRES_ADMIN_PASSWORD:?Set POSTGRES_ADMIN_PASSWORD in .env}
+      POSTGRES_APP_PASSWORD: ${POSTGRES_APP_PASSWORD:?Set POSTGRES_APP_PASSWORD in .env}
+      POSTGRES_MIGRATION_PASSWORD: ${POSTGRES_MIGRATION_PASSWORD:?Set POSTGRES_MIGRATION_PASSWORD in .env}
+      POSTGRES_REPORT_PASSWORD: ${POSTGRES_REPORT_PASSWORD:?Set POSTGRES_REPORT_PASSWORD in .env}
+      POSTGRES_BACKUP_PASSWORD: ${POSTGRES_BACKUP_PASSWORD:?Set POSTGRES_BACKUP_PASSWORD in .env}
+    command:
+      - postgres
+      - -c
+      - ssl=on
+      - -c
+      - ssl_cert_file=/run/postgres-tls/server.crt
+      - -c
+      - ssl_key_file=/run/postgres-tls/server.key
+      - -c
+      - password_encryption=scram-sha-256
+      - -c
+      - log_connections=on
+      - -c
+      - log_disconnections=on
+      - -c
+      - hba_file=/etc/postgresql/pg_hba.conf
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - postgres_tls:/run/postgres-tls:ro
+      - ./infra/security/init-postgres-roles.sh:/docker-entrypoint-initdb.d/10-security.sh:ro
+      - ./infra/security/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
+    networks:
+      - database
+    depends_on:
+      tls-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${POSTGRES_ADMIN_USER:-nuam_admin} -d ${POSTGRES_DB:-nuam}",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  mongo:
+    image: mongo:7@sha256:8bb4442761a63a8dda452744082cdac9644b429807eb977b42324a63cef59ca4
+    environment:
+      MONGO_INITDB_DATABASE: ${MONGO_DB:-nuam_cargas}
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USER:-nuam_root}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD:?Set MONGO_ROOT_PASSWORD in .env}
+      MONGO_DB: ${MONGO_DB:-nuam_cargas}
+      MONGO_APP_USER: ${MONGO_APP_USER:-app_cargas}
+      MONGO_APP_PASSWORD: ${MONGO_APP_PASSWORD:?Set MONGO_APP_PASSWORD in .env}
+      MONGO_REPORT_USER: ${MONGO_REPORT_USER:-nuam_report}
+      MONGO_REPORT_PASSWORD: ${MONGO_REPORT_PASSWORD:?Set MONGO_REPORT_PASSWORD in .env}
+      MONGO_BACKUP_USER: ${MONGO_BACKUP_USER:-nuam_backup}
+      MONGO_BACKUP_PASSWORD: ${MONGO_BACKUP_PASSWORD:?Set MONGO_BACKUP_PASSWORD in .env}
+    command:
+      - mongod
+      - --bind_ip_all
+      - --noscripting
+      - --tlsMode
+      - preferTLS
+      - --tlsCertificateKeyFile
+      - /run/mongo-tls/server.pem
+      - --tlsCAFile
+      - /run/mongo-tls/ca.pem
+      - --tlsAllowConnectionsWithoutCertificates
+    volumes:
+      - mongo_data:/data/db
+      - mongo_tls:/run/mongo-tls:ro
+      - ./infra/security/init-mongo-users.js:/docker-entrypoint-initdb.d/10-security.js:ro
+    networks:
+      - database
+    depends_on:
+      tls-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "mongosh --quiet --host localhost --tls --tlsCAFile /run/mongo-tls/ca.pem --eval 'db.adminCommand({ ping: 1 }).ok' | grep 1",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
+  migrate:
+    build:
+      context: ./backend
+    environment:
+      <<: *backend-environment
+      POSTGRES_USER: ${POSTGRES_MIGRATION_USER:-nuam_migrator}
+      POSTGRES_PASSWORD: ${POSTGRES_MIGRATION_PASSWORD:?Set POSTGRES_MIGRATION_PASSWORD in .env}
+      POSTGRES_SSLMODE: verify-full
+      POSTGRES_SSLROOTCERT: /run/db-ca/postgres-ca.pem
+    volumes:
+      - ./backend:/app
+      - db_ca:/run/db-ca:ro
+    networks:
+      - database
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command:
+      - sh
+      - -c
+      - python manage.py migrate --noinput && python manage.py sembrar_catalogos
+    restart: "no"
+
+  mongo-schema:
+    build:
+      context: ./backend
+    environment:
+      DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY:?Set DJANGO_SECRET_KEY in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-nuam}
+      MONGO_DB: ${MONGO_DB:-nuam_cargas}
+      MONGO_URI: mongodb://${MONGO_ROOT_USER:-nuam_root}:${MONGO_ROOT_PASSWORD:?Set MONGO_ROOT_PASSWORD in .env}@mongo:27017/admin?authSource=admin&tls=true&tlsCAFile=/run/db-ca/mongo-ca.pem
+    volumes:
+      - ./backend:/app
+      - db_ca:/run/db-ca:ro
+    networks:
+      - database
+    depends_on:
+      mongo:
+        condition: service_healthy
+    command: python manage.py preparar_mongo_cargas
+    restart: "no"
+
+  backend:
+    build:
+      context: ./backend
+    environment:
+      <<: *backend-environment
+      POSTGRES_USER: ${POSTGRES_APP_USER:-nuam_app}
+      POSTGRES_PASSWORD: ${POSTGRES_APP_PASSWORD:?Set POSTGRES_APP_PASSWORD in .env}
+      POSTGRES_SSLMODE: verify-full
+      POSTGRES_SSLROOTCERT: /run/db-ca/postgres-ca.pem
+      MONGO_URI: mongodb://${MONGO_APP_USER:-app_cargas}:${MONGO_APP_PASSWORD:?Set MONGO_APP_PASSWORD in .env}@mongo:27017/${MONGO_DB:-nuam_cargas}?authSource=${MONGO_DB:-nuam_cargas}&tls=true&tlsCAFile=/run/db-ca/mongo-ca.pem
+      MONGO_DB: ${MONGO_DB:-nuam_cargas}
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - ./backend:/app
+      - db_ca:/run/db-ca:ro
+    networks:
+      - app
+      - database
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mongo:
+        condition: service_healthy
+      mongo-schema:
+        condition: service_completed_successfully
+      migrate:
+        condition: service_completed_successfully
+    command: python manage.py runserver 0.0.0.0:8000
+    healthcheck:
+      test: ["CMD", "python", "manage.py", "check"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
+  outbox-worker:
+    build:
+      context: ./backend
+    environment:
+      <<: *backend-environment
+      POSTGRES_USER: ${POSTGRES_APP_USER:-nuam_app}
+      POSTGRES_PASSWORD: ${POSTGRES_APP_PASSWORD:?Set POSTGRES_APP_PASSWORD in .env}
+      POSTGRES_SSLMODE: verify-full
+      POSTGRES_SSLROOTCERT: /run/db-ca/postgres-ca.pem
+      MONGO_URI: mongodb://${MONGO_APP_USER:-app_cargas}:${MONGO_APP_PASSWORD:?Set MONGO_APP_PASSWORD in .env}@mongo:27017/${MONGO_DB:-nuam_cargas}?authSource=${MONGO_DB:-nuam_cargas}&tls=true&tlsCAFile=/run/db-ca/mongo-ca.pem
+      MONGO_DB: ${MONGO_DB:-nuam_cargas}
+    volumes:
+      - ./backend:/app
+      - db_ca:/run/db-ca:ro
+    networks:
+      - database
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mongo:
+        condition: service_healthy
+      mongo-schema:
+        condition: service_completed_successfully
+      migrate:
+        condition: service_completed_successfully
+    command: python manage.py procesar_outbox_cargas
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+    ports:
+      - "127.0.0.1:5173:5173"
+    volumes:
+      - ./frontend:/app
+      - frontend_node_modules:/app/node_modules
+    networks:
+      - app
+    command: npm run dev -- --host 0.0.0.0
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+networks:
+  app:
+  database:
+    internal: true
+
+volumes:
+  postgres_data:
+  mongo_data:
+  frontend_node_modules:
+  db_ca:
+  postgres_tls:
+  mongo_tls:

@@ -1,0 +1,93 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: nuam
+          POSTGRES_USER: nuam_app
+          POSTGRES_PASSWORD: ci-only-password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U nuam_app -d nuam"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DJANGO_SECRET_KEY: ci-only-not-for-production-use-a-long-test-key
+      DJANGO_DEBUG: "true"
+      DJANGO_ALLOWED_HOSTS: localhost,127.0.0.1
+      POSTGRES_DB: nuam
+      POSTGRES_USER: nuam_app
+      POSTGRES_PASSWORD: ci-only-password
+      POSTGRES_HOST: 127.0.0.1
+      POSTGRES_PORT: "5432"
+      LOGIN_RATE_LIMIT: 100/min
+      JWT_REFRESH_COOKIE_SECURE: "false"
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: backend/requirements-dev.txt
+
+      - name: Install Python dependencies
+        run: python -m pip install -r backend/requirements-dev.txt
+
+      - name: Check Django configuration and migrations
+        working-directory: backend
+        run: |
+          python manage.py check
+          python manage.py makemigrations --check --dry-run
+
+      - name: Run backend tests
+        working-directory: backend
+        run: python manage.py test apps.cuentas.tests apps.calificaciones.tests apps.calificaciones.test_calculo
+
+      - name: Run flake8
+        working-directory: backend
+        run: flake8 --config .flake8 apps/cuentas apps/calificaciones config
+
+      - name: Run Bandit
+        working-directory: backend
+        run: bandit -r apps config -ll
+
+      - name: Audit Python dependencies
+        run: pip-audit -r backend/requirements.txt
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Audit frontend dependencies
+        working-directory: frontend
+        run: npm audit
+
+      - name: Build frontend
+        working-directory: frontend
+        run: npm run build
